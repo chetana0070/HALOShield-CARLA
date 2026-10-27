@@ -1,0 +1,84 @@
+project:
+  name: HALOShield-CARLA
+  version: 0.1.0
+
+experiment:
+  duration_s: 120.0
+  fixed_delta_s: 0.05
+  target_speed_mps: 8.0
+  warmup_s: 4.0
+  preferred_maps: [Town03, Town04, Town05, Town01, Town02]
+  mode: shield
+
+traffic:
+  npc_vehicles_min: 10
+  npc_vehicles_max: 18
+  pedestrians_min: 4
+  pedestrians_max: 10
+  tm_port: 8000
+  global_distance_m: 2.5
+  hybrid_physics: true
+  hybrid_radius_m: 60.0
+
+scenario:
+  lead_spawn_distance_m: [30.0, 42.0]
+  hazard_events: 2
+  hazard_first_window_s: [28.0, 42.0]
+  hazard_second_window_s: [70.0, 92.0]
+  hazard_brake_duration_s: [3.5, 6.0]
+  hazard_brake_intensity: [0.75, 1.0]
+  weather_choices: [ClearNoon, CloudyNoon, WetNoon, SoftRainSunset, ClearSunset]
+
+safety:
+  enabled: true
+  monitor_range_m: 55.0
+  corridor_half_width_m: 2.4
+  horizons_s: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+  base_margin_m: 0.8
+  uncertainty_initial_m: 0.25
+  uncertainty_growth_mps: 0.35
+  caution_ttc_s: 4.0
+  warning_ttc_s: 2.5
+  critical_ttc_s: 1.2
+  warning_clearance_m: 1.2
+  critical_clearance_m: 0.15
+  warning_brake: 0.55
+  critical_brake: 1.0
+  hold_s: 0.7
+
+controller:
+  lookahead_m: 6.0
+  waypoint_step_m: 3.0
+  steer_kp: 1.15
+  steer_kd: 0.12
+  speed_kp: 0.35
+  speed_ki: 0.04
+  speed_kd: 0.05
+  max_throttle: 0.65
+  max_brake: 0.85
+
+camera:
+  width: 960
+  height: 540
+  fov: 90
+  fps: 10
+  x: -6.5
+  z: 3.2
+  pitch: -12.0
+
+server:
+  host: 127.0.0.1
+  port: 2000
+  timeout_s: 75.0
+  quality: Low
+  offscreen: true
+  no_sound: true
+
+recording:
+  prefer_nvenc: true
+  crf: 27
+  fps: 10
+
+storage:
+  min_free_before_run_gb: 4.0
+  output_root: outputs

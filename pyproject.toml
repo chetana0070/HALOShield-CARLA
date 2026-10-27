@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "haloshield-carla"
+version = "0.1.0"
+description = "Uncertainty-aware predictive runtime safety shielding for randomized CARLA experiments"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = {text = "MIT"}
+authors = [{name = "HALOShield-CARLA Research Prototype"}]
+dependencies = [
+  "numpy==1.26.4",
+  "PyYAML==6.0.2",
+  "psutil==6.1.1",
+  "Pillow==11.0.0",
+  "pygame==2.6.1",
+  "matplotlib==3.9.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.4"]
+
+[project.scripts]
+haloshield = "haloshield.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
