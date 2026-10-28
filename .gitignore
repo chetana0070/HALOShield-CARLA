@@ -41,3 +41,10 @@ benchmark_outputs/
 
 # Temporary backup files
 *backup*
+
+# Generated Python package metadata
+*.egg-info/
+
+# Local files
+.haloshield.env
+benchmark_outputs/
