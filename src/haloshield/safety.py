@@ -21,6 +21,7 @@ class SafetyConfig:
     critical_ttc_s: float
     warning_clearance_m: float
     critical_clearance_m: float
+    min_closing_speed_mps: float
     warning_brake: float
     critical_brake: float
     hold_s: float
@@ -39,6 +40,9 @@ class SafetyConfig:
             critical_ttc_s=float(cfg["critical_ttc_s"]),
             warning_clearance_m=float(cfg["warning_clearance_m"]),
             critical_clearance_m=float(cfg["critical_clearance_m"]),
+            min_closing_speed_mps=float(
+                cfg.get("min_closing_speed_mps", 0.5)
+            ),
             warning_brake=float(cfg["warning_brake"]),
             critical_brake=float(cfg["critical_brake"]),
             hold_s=float(cfg["hold_s"]),
@@ -93,10 +97,43 @@ class PredictiveSafetyShield:
                 min_clearance = min(min_clearance, separation - envelope)
 
             risk_ttc = 0.0 if ttc is None else clamp((self.cfg.caution_ttc_s - ttc) / self.cfg.caution_ttc_s, 0.0, 1.0)
-            risk_clearance = clamp((self.cfg.warning_clearance_m - min_clearance) / max(self.cfg.warning_clearance_m, 0.1), 0.0, 1.0)
-            score = max(risk_ttc, risk_clearance)
+            # Predicted low clearance is only actionable when relative
+            # motion is actually closing the longitudinal gap. Without this
+            # gate, a nearby actor travelling at the same speed can cause the
+            # shield to brake indefinitely.
+            is_closing = (
+                closing_speed >= self.cfg.min_closing_speed_mps
+            )
 
-            candidate = self._decision(actor.actor_id, ttc, min_clearance, score)
+            risk_clearance = (
+                clamp(
+                    (
+                        self.cfg.warning_clearance_m
+                        - min_clearance
+                    )
+                    / max(
+                        self.cfg.warning_clearance_m,
+                        0.1,
+                    ),
+                    0.0,
+                    1.0,
+                )
+                if is_closing
+                else 0.0
+            )
+
+            score = max(
+                risk_ttc,
+                risk_clearance,
+            )
+
+            candidate = self._decision(
+                actor.actor_id,
+                ttc,
+                min_clearance,
+                score,
+                closing_speed,
+            )
             if candidate.risk_score > best.risk_score or (
                 candidate.risk_score == best.risk_score and candidate.brake_override > best.brake_override
             ):
@@ -118,16 +155,48 @@ class PredictiveSafetyShield:
             self._held_brake = 0.0
         return best
 
-    def _decision(self, actor_id: int, ttc: float | None, clearance: float, score: float) -> SafetyDecision:
-        critical = (ttc is not None and ttc <= self.cfg.critical_ttc_s) or clearance <= self.cfg.critical_clearance_m
-        warning = (ttc is not None and ttc <= self.cfg.warning_ttc_s) or clearance <= self.cfg.warning_clearance_m
+    def _decision(
+        self,
+        actor_id: int,
+        ttc: float | None,
+        clearance: float,
+        score: float,
+        closing_speed: float,
+    ) -> SafetyDecision:
+        is_closing = (
+            closing_speed >= self.cfg.min_closing_speed_mps
+        )
+
+        critical = (
+            (
+                ttc is not None
+                and ttc <= self.cfg.critical_ttc_s
+            )
+            or (
+                is_closing
+                and clearance
+                <= self.cfg.critical_clearance_m
+            )
+        )
+
+        warning = (
+            (
+                ttc is not None
+                and ttc <= self.cfg.warning_ttc_s
+            )
+            or (
+                is_closing
+                and clearance
+                <= self.cfg.warning_clearance_m
+            )
+        )
         caution = ttc is not None and ttc <= self.cfg.caution_ttc_s
         if critical:
             return SafetyDecision("CRITICAL", score, ttc, clearance, actor_id, True, self.cfg.critical_brake, 0.0, "predicted collision envelope")
         if warning:
             return SafetyDecision("WARNING", score, ttc, clearance, actor_id, True, self.cfg.warning_brake, 0.0, "short TTC / low predicted clearance")
         if caution:
-            return SafetyDecision("CAUTION", score, ttc, clearance, actor_id, False, 0.0, 0.35, "closing actor ahead")
+            return SafetyDecision("CAUTION", score, ttc, clearance, actor_id, False, 0.0, 1.0, "closing actor ahead")
         return SafetyDecision("CLEAR", score, ttc, clearance, actor_id, False, 0.0, 1.0, "monitored actor remains outside intervention thresholds")
 
     def apply(self, nominal: NominalControl, decision: SafetyDecision, enabled: bool = True) -> NominalControl:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -38,6 +39,7 @@ class CarlaServerManager:
         self.log_path = log_path
         self.process: subprocess.Popen | None = None
         self._owns_server = False
+        self._server_pgid: int | None = None
         self._log_handle = None
 
     def start_if_needed(self) -> bool:
@@ -75,6 +77,10 @@ class CarlaServerManager:
             start_new_session=True,
             env=env,
         )
+        # start_new_session=True makes the initial PID the process-group
+        # leader. Preserve that PGID even if CarlaUE4.sh later exits while
+        # the Unreal binary remains alive.
+        self._server_pgid = self.process.pid
         self._owns_server = True
         return True
 
@@ -98,13 +104,69 @@ class CarlaServerManager:
         )
 
     def stop(self) -> None:
-        if self._owns_server and self.process and self.process.poll() is None:
-            self.process.terminate()
+        """Terminate the complete CARLA process group owned by this run."""
+
+        pgid = self._server_pgid
+
+        if self._owns_server and pgid is not None:
             try:
-                self.process.wait(timeout=15)
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                if self.process is not None:
+                    try:
+                        self.process.terminate()
+                    except ProcessLookupError:
+                        pass
+
+            # Wait for Unreal to release RPC port 2000, not merely for the
+            # shell wrapper process to exit.
+            host = str(self.cfg["host"])
+            port = int(self.cfg["port"])
+
+            deadline = time.monotonic() + 15.0
+
+            while (
+                time.monotonic() < deadline
+                and port_in_use(host, port)
+            ):
+                time.sleep(0.5)
+
+            if port_in_use(host, port):
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    if self.process is not None:
+                        try:
+                            self.process.kill()
+                        except ProcessLookupError:
+                            pass
+
+                deadline = time.monotonic() + 5.0
+
+                while (
+                    time.monotonic() < deadline
+                    and port_in_use(host, port)
+                ):
+                    time.sleep(0.25)
+
+        if self.process is not None:
+            try:
+                self.process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+                pass
+            except ChildProcessError:
+                pass
+
+        self.process = None
+        self._owns_server = False
+        self._server_pgid = None
+
         if self._log_handle:
-            self._log_handle.close()
-            self._log_handle = None
+            try:
+                self._log_handle.close()
+            finally:
+                self._log_handle = None

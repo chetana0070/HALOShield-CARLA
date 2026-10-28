@@ -8,6 +8,18 @@ for arg in "$@"; do
   [[ "$arg" == "--doctor" ]] && DOCTOR=1
 done
 
+# Remove a stale CARLA 0.9.16 process left by an abnormal previous run.
+# This only targets CARLA's Unreal process on HALOShield's RPC port.
+if [[ "$DOCTOR" -eq 0 ]]; then
+  if pgrep -af "CarlaUE4-Linux-Shipping.*carla-rpc-port=2000" >/dev/null 2>&1; then
+    echo "[CARLA] Removing stale managed CARLA process from previous run"
+    pkill -TERM -f "CarlaUE4-Linux-Shipping.*carla-rpc-port=2000" 2>/dev/null || true
+    sleep 3
+    pkill -KILL -f "CarlaUE4-Linux-Shipping.*carla-rpc-port=2000" 2>/dev/null || true
+    sleep 2
+  fi
+fi
+
 if [[ "$DOCTOR" -eq 1 ]]; then
   "$ROOT/scripts/bootstrap.sh" --no-carla
 else

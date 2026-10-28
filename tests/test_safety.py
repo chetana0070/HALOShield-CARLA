@@ -46,3 +46,85 @@ def test_lateral_actor_outside_corridor_is_ignored():
     shield = make_shield()
     decision = shield.evaluate(ego(), [actor(8, speed=0, y=12)], 0.0)
     assert decision.intervention is False
+
+
+def test_close_same_speed_lead_does_not_intervene():
+    shield = make_shield()
+
+    decision = shield.evaluate(
+        ego(speed=8.0),
+        [actor(9.0, speed=8.0)],
+        0.0,
+    )
+
+    assert decision.intervention is False
+    assert decision.risk_level == "CLEAR"
+
+
+def test_stopped_ego_near_stopped_actor_does_not_latch_brake():
+    shield = make_shield()
+
+    decision = shield.evaluate(
+        ego(speed=0.0),
+        [actor(8.0, speed=0.0)],
+        0.0,
+    )
+
+    assert decision.intervention is False
+
+
+def test_hard_braking_lead_still_triggers_intervention():
+    shield = make_shield()
+
+    decision = shield.evaluate(
+        ego(speed=8.0),
+        [actor(11.0, speed=2.0)],
+        0.0,
+    )
+
+    assert decision.intervention is True
+    assert decision.risk_level in {
+        "WARNING",
+        "CRITICAL",
+    }
+
+
+def test_close_same_speed_lead_does_not_intervene():
+    shield = make_shield()
+
+    decision = shield.evaluate(
+        ego(speed=8.0),
+        [actor(9.0, speed=8.0)],
+        0.0,
+    )
+
+    assert decision.intervention is False
+    assert decision.risk_level == "CLEAR"
+
+
+def test_stopped_ego_near_stopped_actor_does_not_latch_brake():
+    shield = make_shield()
+
+    decision = shield.evaluate(
+        ego(speed=0.0),
+        [actor(8.0, speed=0.0)],
+        0.0,
+    )
+
+    assert decision.intervention is False
+
+
+def test_hard_braking_lead_still_triggers_intervention():
+    shield = make_shield()
+
+    decision = shield.evaluate(
+        ego(speed=8.0),
+        [actor(11.0, speed=2.0)],
+        0.0,
+    )
+
+    assert decision.intervention is True
+    assert decision.risk_level in {
+        "WARNING",
+        "CRITICAL",
+    }

@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 import yaml
 
-from .autonomy import RoadFollower
+from .autonomy import AdaptiveCruiseSupervisor, RoadFollower
 from .carla_bridge import CarlaServerManager, import_carla
 from .dashboard import Dashboard
 from .logging_utils import configure_logging, log
@@ -102,7 +102,7 @@ class ExperimentRunner:
             self.server.wait_until_ready()
 
             client = carla.Client(str(self.cfg["server"]["host"]), int(self.cfg["server"]["port"]))
-            client.set_timeout(15.0)
+            client.set_timeout(120.0)
             available_maps = client.get_available_maps()
             scenario = scenario_from_dict(self.replay_scenario) if self.replay_scenario is not None else generate_scenario(self.seed, self.cfg, available_maps)
             write_json(self.run_dir / "scenario.json", scenario.to_dict())
@@ -123,6 +123,9 @@ class ExperimentRunner:
             lead_controller = RoadFollower(self.world.get_map(), self.cfg["controller"], self.seed ^ 0x1155AA77)
             lead_controller.reset(lead)
             shield = PredictiveSafetyShield(SafetyConfig.from_mapping(self.cfg["safety"]))
+            following_supervisor = AdaptiveCruiseSupervisor(
+                self.cfg["controller"]
+            )
 
             camera_cfg = self.cfg["camera"]
             rec_cfg = self.cfg["recording"]
@@ -142,11 +145,12 @@ class ExperimentRunner:
             sim_time = 0.0
             event_state: dict[int, bool] = {}
             event_done: dict[int, bool] = {}
+            event_started_at: dict[int, float] = {}
             next_status = 0.0
 
             # Prime synchronous sensors and physics.
             for _ in range(max(2, int(warmup_s / dt))):
-                self.world.tick()
+                self.world.tick(120.0)
                 if self.stop_requested:
                     break
             warm_frame, _ = camera_buffer.latest()
@@ -155,27 +159,194 @@ class ExperimentRunner:
 
             while sim_time < duration_s and not self.stop_requested:
                 loop_start = time.perf_counter()
-                # Script the lead vehicle with the same readable lane follower. Hazard windows
-                # temporarily replace its normal control with hard braking.
-                lead_nominal = lead_controller.control(lead, dt, target_speed * 0.88)
+
+                # Service the Pygame/desktop event queue every simulation tick.
+                # Without this, GNOME may label the visualization window
+                # "not responding" even though CARLA is still running.
+                try:
+                    import pygame
+
+                    for event in pygame.event.get():
+                        if event.type == pygame.QUIT:
+                            self.stop_requested = True
+                except Exception:
+                    pass
+
+                if self.stop_requested:
+                    break
+                # ------------------------------------------------------------
+                # Scenario supervisor
+                #
+                # Hazard trigger_s is now the EARLIEST eligible time, rather
+                # than an unconditional wall-clock trigger. A hard-braking
+                # event is only activated when the ego is actually moving and
+                # the scripted lead is within a scientifically useful gap.
+                # ------------------------------------------------------------
+
+                ego_speed_before = self._speed(ego)
+                ego_red_light = self._must_stop_for_red_light(
+                    ego,
+                    carla,
+                )
+
+                gap_m = float(
+                    ego.get_location().distance(
+                        lead.get_location()
+                    )
+                )
+
+                desired_gap_m = float(scenario.lead_distance_m)
+
+                # Pace the scripted lead so red lights and other delays do not
+                # make it disappear far ahead of the ego vehicle.
+                lead_target_speed = target_speed * 0.88
+
+                if gap_m > desired_gap_m + 8.0:
+                    lead_target_speed = target_speed * 0.55
+                elif gap_m < max(12.0, desired_gap_m - 8.0):
+                    lead_target_speed = target_speed
+
+                lead_nominal = lead_controller.control(
+                    lead,
+                    dt,
+                    lead_target_speed,
+                )
+
+                # Keep the scripted lead coupled to the experiment when the
+                # ego is legitimately stopped at a signal.
+                if ego_red_light or self._must_stop_for_red_light(
+                    lead,
+                    carla,
+                ):
+                    lead_nominal = NominalControl(
+                        0.0,
+                        max(lead_nominal.brake, 0.75),
+                        lead_nominal.steer,
+                    )
+
                 phase = "nominal"
                 active_hazard = False
-                for idx, event in enumerate(scenario.hazard_events):
-                    active = event.trigger_s <= sim_time < (event.trigger_s + event.duration_s)
+
+                min_hazard_speed = float(
+                    self.cfg["scenario"].get(
+                        "hazard_min_ego_speed_mps",
+                        4.0,
+                    )
+                )
+
+                valid_gap = self.cfg["scenario"].get(
+                    "hazard_valid_gap_m",
+                    [10.0, 45.0],
+                )
+
+                min_gap_m = float(valid_gap[0])
+                max_gap_m = float(valid_gap[1])
+
+                for idx, event in enumerate(
+                    scenario.hazard_events
+                ):
+                    started_at = event_started_at.get(idx)
+
+                    # trigger_s means "not before this simulation time".
+                    # Actual activation waits until the physical state makes
+                    # the experiment meaningful.
+                    if started_at is None:
+                        eligible = (
+                            sim_time >= float(event.trigger_s)
+                            and ego_speed_before >= min_hazard_speed
+                            and not ego_red_light
+                            and min_gap_m <= gap_m <= max_gap_m
+                        )
+
+                        if eligible:
+                            started_at = sim_time
+                            event_started_at[idx] = sim_time
+                            event_state[idx] = True
+
+                            phase = (
+                                f"lead-hard-brake-{idx + 1}"
+                            )
+
+                            self.events.append(
+                                {
+                                    "sim_time_s": sim_time,
+                                    "type": "hazard_start",
+                                    "detail": (
+                                        f"{phase}; "
+                                        f"scheduled_not_before="
+                                        f"{event.trigger_s:.2f}; "
+                                        f"ego_speed_mps="
+                                        f"{ego_speed_before:.2f}; "
+                                        f"gap_m={gap_m:.2f}"
+                                    ),
+                                }
+                            )
+
+                            log(
+                                self.logger,
+                                "SCENARIO",
+                                f"Hazard {idx + 1} started "
+                                f"at t={sim_time:.1f}s "
+                                f"(eligible after "
+                                f"{event.trigger_s:.1f}s, "
+                                f"speed={ego_speed_before:.1f}m/s, "
+                                f"gap={gap_m:.1f}m)",
+                            )
+
+                    started_at = event_started_at.get(idx)
+
+                    active = (
+                        started_at is not None
+                        and started_at
+                        <= sim_time
+                        < started_at + float(event.duration_s)
+                    )
+
                     if active:
                         active_hazard = True
                         phase = f"lead-hard-brake-{idx + 1}"
-                        lead.apply_control(carla.VehicleControl(throttle=0.0, brake=float(event.brake), steer=lead_nominal.steer))
-                        if not event_state.get(idx):
-                            self.events.append({"sim_time_s": sim_time, "type": "hazard_start", "detail": phase})
-                            log(self.logger, "SCENARIO", f"Hazard {idx + 1} started at t={sim_time:.1f}s")
-                        event_state[idx] = True
-                    elif event_state.get(idx) and not event_done.get(idx) and sim_time >= event.trigger_s + event.duration_s:
+
+                        lead.apply_control(
+                            carla.VehicleControl(
+                                throttle=0.0,
+                                brake=float(event.brake),
+                                steer=lead_nominal.steer,
+                            )
+                        )
+
+                    elif (
+                        started_at is not None
+                        and not event_done.get(idx)
+                        and sim_time
+                        >= started_at + float(event.duration_s)
+                    ):
                         event_done[idx] = True
-                        self.events.append({"sim_time_s": sim_time, "type": "hazard_end", "detail": f"lead-hard-brake-{idx + 1}"})
-                        log(self.logger, "SCENARIO", f"Hazard {idx + 1} ended at t={sim_time:.1f}s")
+
+                        self.events.append(
+                            {
+                                "sim_time_s": sim_time,
+                                "type": "hazard_end",
+                                "detail": (
+                                    f"lead-hard-brake-{idx + 1}"
+                                ),
+                            }
+                        )
+
+                        log(
+                            self.logger,
+                            "SCENARIO",
+                            f"Hazard {idx + 1} ended "
+                            f"at t={sim_time:.1f}s",
+                        )
+
                 if not active_hazard:
-                    lead.apply_control(carla.VehicleControl(throttle=lead_nominal.throttle, brake=lead_nominal.brake, steer=lead_nominal.steer))
+                    lead.apply_control(
+                        carla.VehicleControl(
+                            throttle=lead_nominal.throttle,
+                            brake=lead_nominal.brake,
+                            steer=lead_nominal.steer,
+                        )
+                    )
 
                 nominal = controller.control(ego, dt, target_speed)
                 if self._must_stop_for_red_light(ego, carla):
@@ -184,13 +355,46 @@ class ExperimentRunner:
 
                 ego_state = self._ego_state(ego)
                 nearby = self._nearby_actor_states(ego)
+
+                following_status = None
+
+                if phase != "red-light-compliance":
+                    nominal, following_status = (
+                        following_supervisor.apply(
+                            nominal,
+                            ego_state,
+                            nearby,
+                        )
+                    )
+
+                    if (
+                        following_status.active
+                        and phase == "nominal"
+                    ):
+                        phase = "car-following"
+
                 safety_start = time.perf_counter()
                 decision = shield.evaluate(ego_state, nearby, sim_time)
                 safety_latency_ms = (time.perf_counter() - safety_start) * 1000.0
-                final = shield.apply(nominal, decision, enabled=self.mode == "shield")
+                final = shield.apply(
+                    nominal,
+                    decision,
+                    enabled=self.mode == "shield",
+                )
+
+                shield_changed_control = (
+                    self.mode == "shield"
+                    and (
+                        final.brake
+                        > nominal.brake + 1e-4
+                        or final.throttle
+                        < nominal.throttle - 1e-4
+                    )
+                )
+
                 ego.apply_control(carla.VehicleControl(throttle=final.throttle, brake=final.brake, steer=final.steer))
 
-                self.world.tick()
+                self.world.tick(45.0)
                 snapshot = self.world.get_snapshot()
                 sim_time += dt
                 speed = self._speed(ego)
@@ -209,7 +413,42 @@ class ExperimentRunner:
                     "min_ttc_s": None if decision.min_ttc_s is None else round(decision.min_ttc_s, 4),
                     "min_predicted_clearance_m": None if decision.min_predicted_clearance_m is None else round(decision.min_predicted_clearance_m, 4),
                     "threat_actor_id": decision.threat_actor_id,
-                    "intervention": bool(decision.intervention and self.mode == "shield"),
+                    "intervention": bool(shield_changed_control),
+                    "shield_requested_intervention": bool(
+                        decision.intervention
+                    ),
+                    "following_actor_id": (
+                        None
+                        if following_status is None
+                        else following_status.actor_id
+                    ),
+                    "following_gap_m": (
+                        None
+                        if following_status is None
+                        or following_status.gap_m is None
+                        else round(
+                            following_status.gap_m,
+                            3,
+                        )
+                    ),
+                    "following_desired_gap_m": (
+                        None
+                        if following_status is None
+                        or following_status.desired_gap_m is None
+                        else round(
+                            following_status.desired_gap_m,
+                            3,
+                        )
+                    ),
+                    "following_closing_speed_mps": (
+                        None
+                        if following_status is None
+                        or following_status.closing_speed_mps is None
+                        else round(
+                            following_status.closing_speed_mps,
+                            3,
+                        )
+                    ),
                     "safety_latency_ms": round(safety_latency_ms, 5),
                     "scenario_phase": phase,
                     "frame": int(snapshot.frame),
@@ -233,7 +472,17 @@ class ExperimentRunner:
                         termination_reason = "dashboard_closed"
 
                 if sim_time >= next_status:
-                    log(self.logger, "METRICS", f"t={sim_time:5.1f}s speed={speed*3.6:4.1f}km/h risk={decision.risk_level} interventions={metrics.interventions}")
+                    log(
+                        self.logger,
+                        "METRICS",
+                        f"t={sim_time:5.1f}s "
+                        f"speed={speed*3.6:4.1f}km/h "
+                        f"phase={phase} "
+                        f"nominal=T{nominal.throttle:.2f}/B{nominal.brake:.2f} "
+                        f"applied=T{final.throttle:.2f}/B{final.brake:.2f} "
+                        f"risk={decision.risk_level} "
+                        f"interventions={metrics.interventions}",
+                    )
                     next_status += 10.0
 
                 # Catch runaway loop stalls without changing simulator determinism.
@@ -313,45 +562,201 @@ class ExperimentRunner:
             self.tm.set_hybrid_physics_mode(True)
             self.tm.set_hybrid_physics_radius(float(self.cfg["traffic"].get("hybrid_radius_m", 60.0)))
 
+    def _tick_world(self, timeout_s: float, context: str):
+        """Advance synchronous CARLA simulation with a descriptive timeout."""
+        if self.world is None:
+            raise RuntimeError(
+                f"{context}: CARLA world is not initialized"
+            )
+
+        try:
+            return self.world.tick(float(timeout_s))
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{context}: CARLA tick failed after "
+                f"{timeout_s:.0f}s timeout: {exc}"
+            ) from exc
+
     def _spawn_core_actors(self, carla, scenario: ScenarioSpec):
+        """
+        Spawn the research ego + scripted lead pair.
+
+        A candidate is rejected if either vehicle initially sits inside an
+        active red/yellow traffic-light trigger. Starting there can make an
+        otherwise valid experiment spend its opening seconds stationary,
+        which is undesirable for the hazard-response study.
+        """
         blueprints = self.world.get_blueprint_library()
-        ego_bp = blueprints.find("vehicle.tesla.model3") if blueprints.find("vehicle.tesla.model3") else random.choice(blueprints.filter("vehicle.*"))
-        ego_bp.set_attribute("role_name", "ego")
-        lead_candidates = [bp for bp in blueprints.filter("vehicle.*") if int(bp.get_attribute("number_of_wheels")) == 4] if blueprints.filter("vehicle.*") else []
+
+        ego_bp = blueprints.find("vehicle.tesla.model3")
+        if ego_bp is None:
+            ego_candidates = [
+                bp for bp in blueprints.filter("vehicle.*")
+                if int(bp.get_attribute("number_of_wheels")) == 4
+            ]
+            if not ego_candidates:
+                raise RuntimeError("No four-wheel vehicle blueprints are available")
+            ego_bp = ego_candidates[0]
+
+        if ego_bp.has_attribute("role_name"):
+            ego_bp.set_attribute("role_name", "ego")
+
+        lead_candidates = [
+            bp for bp in blueprints.filter("vehicle.*")
+            if int(bp.get_attribute("number_of_wheels")) == 4
+        ]
+        if not lead_candidates:
+            raise RuntimeError("No valid lead-vehicle blueprints are available")
+
         rng = random.Random(self.seed ^ 0xC0FFEE)
         spawn_points = self.world.get_map().get_spawn_points()
         rng.shuffle(spawn_points)
-        for spawn in spawn_points[: min(40, len(spawn_points))]:
+
+        validation_timeout = float(
+            self.cfg["server"].get("warmup_tick_timeout_s", 120.0)
+        )
+
+        for spawn in spawn_points[:min(40, len(spawn_points))]:
             ego = self.world.try_spawn_actor(ego_bp, spawn)
             if not ego:
                 continue
-            wp = self.world.get_map().get_waypoint(spawn.location, project_to_road=True)
+
+            wp = self.world.get_map().get_waypoint(
+                spawn.location,
+                project_to_road=True,
+            )
+
             lead_wp = wp
             remaining = scenario.lead_distance_m
+
             while remaining > 0 and lead_wp:
                 options = lead_wp.next(min(3.0, remaining))
+
                 if not options:
                     lead_wp = None
                     break
-                # Straightest continuation keeps the scripted lead in the ego corridor.
+
                 current_yaw = lead_wp.transform.rotation.yaw
-                lead_wp = min(options, key=lambda w: self._yaw_delta_deg(current_yaw, w.transform.rotation.yaw))
+
+                lead_wp = min(
+                    options,
+                    key=lambda w: self._yaw_delta_deg(
+                        current_yaw,
+                        w.transform.rotation.yaw,
+                    ),
+                )
+
                 remaining -= 3.0
+
             if lead_wp is None:
-                ego.destroy()
+                try:
+                    ego.destroy()
+                except Exception:
+                    pass
                 continue
+
             lead_bp = rng.choice(lead_candidates)
+
             if lead_bp.has_attribute("role_name"):
-                lead_bp.set_attribute("role_name", "scripted_hazard")
+                lead_bp.set_attribute(
+                    "role_name",
+                    "scripted_hazard",
+                )
+
             lead_transform = lead_wp.transform
             lead_transform.location.z += 0.35
-            lead = self.world.try_spawn_actor(lead_bp, lead_transform)
-            if lead:
-                self.actors.extend([ego, lead])
-                log(self.logger, "SCENARIO", f"Spawned ego and scripted lead at {scenario.lead_distance_m:.1f} m nominal separation")
-                return ego, lead
-            ego.destroy()
-        raise RuntimeError("Could not find a valid ego + lead-vehicle spawn pair after multiple attempts")
+
+            lead = self.world.try_spawn_actor(
+                lead_bp,
+                lead_transform,
+            )
+
+            if not lead:
+                try:
+                    ego.destroy()
+                except Exception:
+                    pass
+                continue
+
+            # Explicitly ensure neither manually controlled vehicle inherits
+            # an unintended parking state.
+            ego.apply_control(
+                carla.VehicleControl(
+                    throttle=0.0,
+                    brake=0.0,
+                    hand_brake=False,
+                )
+            )
+
+            lead.apply_control(
+                carla.VehicleControl(
+                    throttle=0.0,
+                    brake=0.0,
+                    hand_brake=False,
+                )
+            )
+
+            # CARLA traffic-light association is based on the most recent
+            # simulation tick, so tick once before validating the spawn.
+            self._tick_world(
+                validation_timeout,
+                "core actor spawn validation",
+            )
+
+            ego_blocked = self._must_stop_for_red_light(
+                ego,
+                carla,
+            )
+
+            lead_blocked = self._must_stop_for_red_light(
+                lead,
+                carla,
+            )
+
+            if ego_blocked or lead_blocked:
+                log(
+                    self.logger,
+                    "SCENARIO",
+                    "Rejecting core spawn because it begins inside "
+                    "an active red/yellow traffic-light trigger",
+                    level=30,
+                )
+
+                try:
+                    if lead.is_alive:
+                        lead.destroy()
+                except Exception:
+                    pass
+
+                try:
+                    if ego.is_alive:
+                        ego.destroy()
+                except Exception:
+                    pass
+
+                # Commit the destruction before trying the next spawn.
+                self._tick_world(
+                    validation_timeout,
+                    "rejected spawn cleanup",
+                )
+
+                continue
+
+            self.actors.extend([ego, lead])
+
+            log(
+                self.logger,
+                "SCENARIO",
+                f"Spawned ego and scripted lead at "
+                f"{scenario.lead_distance_m:.1f} m nominal separation",
+            )
+
+            return ego, lead
+
+        raise RuntimeError(
+            "Could not find a valid ego + lead spawn pair after "
+            "rejecting occupied and traffic-light-blocked starts"
+        )
 
     def _spawn_background_traffic(self, carla, scenario: ScenarioSpec, ego, lead) -> None:
         rng = random.Random(self.seed ^ 0xBADC0DE)
@@ -487,10 +892,20 @@ class ExperimentRunner:
 
     @staticmethod
     def _must_stop_for_red_light(ego, carla) -> bool:
+        """Return True only when CARLA says the vehicle is at an active signal."""
         try:
-            light = ego.get_traffic_light()
-            return light is not None and light.get_state() in {carla.TrafficLightState.Red, carla.TrafficLightState.Yellow}
+            if not ego.is_at_traffic_light():
+                return False
+
+            state = ego.get_traffic_light_state()
+
+            return state in {
+                carla.TrafficLightState.Red,
+                carla.TrafficLightState.Yellow,
+            }
+
         except Exception:
+            # Traffic-light telemetry must never crash the control loop.
             return False
 
     def _write_events(self) -> None:
@@ -500,39 +915,80 @@ class ExperimentRunner:
                 handle.write(json.dumps(event, sort_keys=True) + "\n")
 
     def _cleanup(self) -> None:
-        log(self.logger, "CARLA", "Cleaning up sensors, walkers, actors, and synchronous settings")
+        """
+        Cleanly release CARLA resources without double-destroy races.
+
+        Sensors are explicitly stopped and destroyed because their Python
+        wrappers otherwise warn when leaving scope. When HALOShield owns
+        the CARLA server, vehicles and walkers are left to Unreal process
+        shutdown, which destroys the complete world atomically.
+        """
+        log(
+            self.logger,
+            "CARLA",
+            "Cleaning up simulation resources",
+        )
+
+        # Sensors need explicit shutdown because their callbacks have their
+        # own lifecycle.
         for sensor in reversed(self.sensors):
             try:
-                if sensor.is_listening:
+                if getattr(sensor, "is_listening", False):
                     sensor.stop()
             except Exception:
                 pass
+
             try:
-                sensor.destroy()
+                if getattr(sensor, "is_alive", False):
+                    sensor.destroy()
             except Exception:
                 pass
+
+        self.sensors.clear()
+
+        if getattr(self.server, "_owns_server", False):
+            log(
+                self.logger,
+                "CARLA",
+                "Managed server detected; vehicles/walkers delegated "
+                "to CARLA process shutdown",
+            )
+
+            # Do not issue individual destroy RPCs for attached walker
+            # controllers and their parents. Killing the managed CARLA
+            # process immediately afterwards destroys the world atomically.
+            self.tm = None
+            self.world = None
+            return
+
+        # External CARLA server: preserve the server, so clean actors
+        # individually where possible.
         for controller in reversed(self.walker_controllers):
             try:
-                controller.stop()
+                if getattr(controller, "is_alive", False):
+                    controller.stop()
+                    controller.destroy()
             except Exception:
                 pass
-            try:
-                controller.destroy()
-            except Exception:
-                pass
+
         for actor in reversed(self.actors):
             try:
-                actor.destroy()
+                if getattr(actor, "is_alive", False):
+                    actor.destroy()
             except Exception:
                 pass
+
         if self.tm:
             try:
                 self.tm.set_synchronous_mode(False)
             except Exception:
                 pass
+
         if self.world and self.original_world_settings:
             try:
-                self.world.apply_settings(self.original_world_settings)
+                self.world.apply_settings(
+                    self.original_world_settings
+                )
             except Exception:
                 pass
 

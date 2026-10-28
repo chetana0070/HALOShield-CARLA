@@ -7,7 +7,7 @@ experiment:
   fixed_delta_s: 0.05
   target_speed_mps: 8.0
   warmup_s: 4.0
-  preferred_maps: [Town03, Town04, Town05, Town01, Town02]
+  preferred_maps: [Town01, Town02]
   mode: shield
 
 traffic:
@@ -23,6 +23,8 @@ traffic:
 scenario:
   lead_spawn_distance_m: [30.0, 42.0]
   hazard_events: 2
+  hazard_min_ego_speed_mps: 4.0
+  hazard_valid_gap_m: [10.0, 45.0]
   hazard_first_window_s: [28.0, 42.0]
   hazard_second_window_s: [70.0, 92.0]
   hazard_brake_duration_s: [3.5, 6.0]
@@ -42,6 +44,7 @@ safety:
   critical_ttc_s: 1.2
   warning_clearance_m: 1.2
   critical_clearance_m: 0.15
+  min_closing_speed_mps: 0.5
   warning_brake: 0.55
   critical_brake: 1.0
   hold_s: 0.7
@@ -56,6 +59,14 @@ controller:
   speed_kd: 0.05
   max_throttle: 0.65
   max_brake: 0.85
+  following_enabled: true
+  following_time_gap_s: 1.5
+  following_min_gap_m: 7.0
+  following_buffer_m: 10.0
+  following_k_gap: 0.10
+  following_k_closing: 0.14
+  following_max_brake: 0.45
+  following_corridor_half_width_m: 1.8
 
 camera:
   width: 960
@@ -69,7 +80,7 @@ camera:
 server:
   host: 127.0.0.1
   port: 2000
-  timeout_s: 75.0
+  timeout_s: 120.0
   quality: Low
   offscreen: true
   no_sound: true

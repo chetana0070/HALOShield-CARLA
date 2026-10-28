@@ -4,7 +4,7 @@ import math
 import random
 from dataclasses import dataclass
 
-from .types import NominalControl
+from .types import ActorState, EgoState, NominalControl
 from .utils import clamp, wrap_angle_rad
 
 
@@ -92,3 +92,225 @@ class RoadFollower:
             throttle = 0.0
             brake = clamp(-effort, 0.0, float(self.cfg["max_brake"]))
         return NominalControl(throttle, brake, steer)
+
+
+
+@dataclass(frozen=True)
+class FollowingStatus:
+    active: bool = False
+    actor_id: int | None = None
+    gap_m: float | None = None
+    desired_gap_m: float | None = None
+    closing_speed_mps: float | None = None
+
+
+class AdaptiveCruiseSupervisor:
+    """Nominal same-lane car-following controller.
+
+    Ordinary traffic following belongs in the nominal autonomy stack.
+    HALOShield should remain an emergency predictive override rather
+    than becoming the everyday longitudinal controller.
+    """
+
+    def __init__(self, cfg: dict) -> None:
+        self.enabled = bool(
+            cfg.get("following_enabled", True)
+        )
+
+        self.time_gap_s = float(
+            cfg.get("following_time_gap_s", 1.5)
+        )
+
+        self.min_gap_m = float(
+            cfg.get("following_min_gap_m", 7.0)
+        )
+
+        self.buffer_m = float(
+            cfg.get("following_buffer_m", 10.0)
+        )
+
+        self.k_gap = float(
+            cfg.get("following_k_gap", 0.10)
+        )
+
+        self.k_closing = float(
+            cfg.get("following_k_closing", 0.14)
+        )
+
+        self.max_brake = float(
+            cfg.get("following_max_brake", 0.45)
+        )
+
+        self.corridor_half_width_m = float(
+            cfg.get(
+                "following_corridor_half_width_m",
+                1.8,
+            )
+        )
+
+    def apply(
+        self,
+        nominal: NominalControl,
+        ego: EgoState,
+        actors: list[ActorState],
+    ) -> tuple[NominalControl, FollowingStatus]:
+
+        if not self.enabled:
+            return nominal, FollowingStatus()
+
+        nearest = None
+
+        for actor in actors:
+
+            # ACC handles vehicles only.
+            # Pedestrians remain part of the independent safety monitor.
+            if not actor.kind.startswith("vehicle."):
+                continue
+
+            rel = actor.position - ego.position
+
+            forward_dist = rel.dot(ego.forward)
+
+            if forward_dist <= 0.0:
+                continue
+
+            lateral_dist = abs(
+                rel.dot(ego.right)
+            )
+
+            lateral_limit = (
+                self.corridor_half_width_m
+                + actor.half_width
+            )
+
+            if lateral_dist > lateral_limit:
+                continue
+
+            gap_m = max(
+                0.0,
+                forward_dist
+                - ego.half_length
+                - actor.half_length,
+            )
+
+            actor_long_speed = (
+                actor.velocity.dot(ego.forward)
+            )
+
+            ego_long_speed = (
+                ego.velocity.dot(ego.forward)
+            )
+
+            closing_speed = (
+                ego_long_speed
+                - actor_long_speed
+            )
+
+            if (
+                nearest is None
+                or gap_m < nearest[0]
+            ):
+                nearest = (
+                    gap_m,
+                    closing_speed,
+                    actor.actor_id,
+                )
+
+        if nearest is None:
+            return nominal, FollowingStatus()
+
+        gap_m, closing_speed, actor_id = nearest
+
+        desired_gap_m = (
+            self.min_gap_m
+            + self.time_gap_s
+            * max(ego.speed_mps, 0.0)
+        )
+
+        soft_limit_m = (
+            desired_gap_m
+            + self.buffer_m
+        )
+
+        if gap_m > soft_limit_m:
+            return (
+                nominal,
+                FollowingStatus(
+                    False,
+                    actor_id,
+                    gap_m,
+                    desired_gap_m,
+                    closing_speed,
+                ),
+            )
+
+        status = FollowingStatus(
+            True,
+            actor_id,
+            gap_m,
+            desired_gap_m,
+            closing_speed,
+        )
+
+        # Inside desired gap:
+        # normal ACC applies moderate braking.
+        if gap_m <= desired_gap_m:
+
+            gap_error = (
+                desired_gap_m
+                - gap_m
+            )
+
+            brake = clamp(
+                self.k_gap * gap_error
+                + self.k_closing
+                * max(closing_speed, 0.0),
+                0.0,
+                self.max_brake,
+            )
+
+            return (
+                NominalControl(
+                    throttle=0.0,
+                    brake=max(
+                        nominal.brake,
+                        brake,
+                    ),
+                    steer=nominal.steer,
+                ),
+                status,
+            )
+
+        # Soft approach zone:
+        # progressively remove throttle before braking
+        # becomes necessary.
+        throttle_scale = clamp(
+            (
+                gap_m
+                - desired_gap_m
+            )
+            / max(
+                self.buffer_m,
+                0.1,
+            ),
+            0.0,
+            1.0,
+        )
+
+        throttle = min(
+            nominal.throttle,
+            nominal.throttle
+            * throttle_scale,
+        )
+
+        if closing_speed > 1.0:
+            throttle = 0.0
+
+        return (
+            NominalControl(
+                throttle=throttle,
+                brake=nominal.brake,
+                steer=nominal.steer,
+            ),
+            status,
+        )
