@@ -45,12 +45,10 @@ Default resource decisions target:
 
 - NVIDIA RTX 5060 Laptop GPU, 8 GB VRAM
 - Intel Core i7-13620H, 10 cores / 16 threads
-- 16 GB RAM
 - Ubuntu 24.04.4 LTS
 - NVIDIA driver 580.126.20
 - CUDA-capable driver; CUDA toolkit reinstallation is not required
-- ~32 GB free storage before first install
-
+  
 The project uses a 960×540, 10 FPS research camera, conservative traffic counts, UE4 `Low` quality, offscreen CARLA rendering plus a lightweight dashboard, no neural model training, and bounded logging.
 
 ## One-command use
@@ -207,7 +205,7 @@ haloshield-carla/
 └── docs/
 ```
 
-## Research integrity and safety scope
+## Project integrity and safety scope
 
 This project is simulation research software. It is **not** NVIDIA-certified, Halos-certified, ASIL-certified, a production AV stack, or evidence that a real vehicle is safe. Do not deploy it on public roads or real vehicles. Benchmark results must be measured before any claim about improvement is made.
 
