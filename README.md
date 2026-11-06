@@ -4,7 +4,7 @@
 
 HALOShield-CARLA is a research-grade, laptop-constrained autonomous-driving safety prototype. It runs a randomized ~120-second closed-loop CARLA scenario, compares a nominal waypoint-following controller with an independent predictive safety shield, records the experiment to MP4, and saves traceable safety evidence.
 
-## Research question
+## Question
 
 **Can a lightweight, uncertainty-inflated short-horizon runtime safety shield reduce collision exposure and critical time-to-collision events in randomized CARLA interactions while preserving useful driving progress on commodity 8 GB GPU hardware?**
 
